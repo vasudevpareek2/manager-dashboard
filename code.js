@@ -64,6 +64,12 @@ function getDashboardData(request) {
   const view = normalizeView_(request.view);
   const filters = Object.assign({}, request);
   delete filters.view;
+  
+  // Check if cache should be cleared
+  if (request.forceRefresh) {
+    clearCache_();
+  }
+  
   const sellers = getSellers_();
   const profile = getLeadProfile_(view, filters);
   const leads = getLeads_(sellers, profile).filter(function (lead) {
@@ -79,6 +85,9 @@ function getLeadDetails(request) {
   const sellerEmail = cleanEmail_(request.sellerEmail);
   const stage = normalizeStage_(request.stage);
   const state = normalizeState_(request.state);
+  const pageSize = request.pageSize || 100;
+  const pageNumber = request.pageNumber || 1;
+  
   const sellers = getSellers_();
   const leads = getLeads_(sellers, { details: true, dateFilter: true }).filter(function (lead) {
     if (!passesDashboardFilters_(lead, filters)) return false;
@@ -88,9 +97,17 @@ function getLeadDetails(request) {
     return true;
   });
 
+  const total = leads.length;
+  const startIndex = (pageNumber - 1) * pageSize;
+  const endIndex = Math.min(startIndex + pageSize, total);
+  const paginatedLeads = leads.slice(startIndex, endIndex);
+
   return {
-    rows: leads.map(leadDetailRow_),
-    total: leads.length,
+    rows: paginatedLeads.map(leadDetailRow_),
+    total: total,
+    pageNumber: pageNumber,
+    pageSize: pageSize,
+    totalPages: Math.ceil(total / pageSize),
     generatedAt: formatDateTime_(new Date())
   };
 }
@@ -133,51 +150,49 @@ function getLeadProfile_(view, filters) {
 
 function buildDashboard_(leads, sellers, filters, view) {
   const flags = getViewFlags_(view);
-  const sellerRows = {};
-  const managerMap = {};
-  const activityRows = {};
-  const agingRows = {};
-  const qualityRows = {};
-  const unmappedStages = {};
-  const unmappedSellers = {};
+  const sellerRows = new Map();
+  const managerMap = new Map();
+  const activityRows = new Map();
+  const agingRows = new Map();
+  const qualityRows = new Map();
+  const unmappedStages = new Map();
+  const unmappedSellers = new Map();
   const today = startOfDay_(new Date());
 
   leads.forEach(function (lead) {
     const email = lead.salesEmail || 'unassigned';
     const seller = lead.seller || makeFallbackSeller_(email);
     if (flags.stage || flags.overview) {
-      if (!sellerRows[email]) sellerRows[email] = makeSellerStageRow_(seller);
-      addLeadToSellerStageRow_(sellerRows[email], lead);
+      if (!sellerRows.has(email)) sellerRows.set(email, makeSellerStageRow_(seller));
+      addLeadToSellerStageRow_(sellerRows.get(email), lead);
     }
     if (flags.manager) {
       addLeadToManagerRows_(managerMap, lead);
     }
     if (flags.activity || flags.overview) {
-      if (!activityRows[email]) activityRows[email] = makeActivityRow_(seller);
-      addLeadToActivityRow_(activityRows[email], lead);
+      if (!activityRows.has(email)) activityRows.set(email, makeActivityRow_(seller));
+      addLeadToActivityRow_(activityRows.get(email), lead);
     }
     if (flags.aging) {
-      if (!agingRows[email]) agingRows[email] = makeAgingRow_(seller);
-      addLeadToAgingRow_(agingRows[email], lead, today);
+      if (!agingRows.has(email)) agingRows.set(email, makeAgingRow_(seller));
+      addLeadToAgingRow_(agingRows.get(email), lead, today);
     }
     if (flags.quality) {
-      if (!qualityRows[email]) qualityRows[email] = makeQualityRow_(seller);
-      addLeadToQualityRow_(qualityRows[email], lead);
+      if (!qualityRows.has(email)) qualityRows.set(email, makeQualityRow_(seller));
+      addLeadToQualityRow_(qualityRows.get(email), lead);
     }
 
     if (!lead.stageKey) {
       const raw = lead.currentLeadStage || 'blank';
-      unmappedStages[raw] = (unmappedStages[raw] || 0) + 1;
+      unmappedStages.set(raw, (unmappedStages.get(raw) || 0) + 1);
     }
     if (!lead.sellerMapped) {
       const email = lead.salesEmail || 'blank';
-      unmappedSellers[email] = (unmappedSellers[email] || 0) + 1;
+      unmappedSellers.set(email, (unmappedSellers.get(email) || 0) + 1);
     }
   });
 
-  const sellerList = Object.keys(sellerRows).map(function (email) {
-    return finalizeSellerStageRow_(sellerRows[email]);
-  }).sort(sortByOpenThenName_);
+  const sellerList = Array.from(sellerRows.values()).map(finalizeSellerStageRow_).sort(sortByOpenThenName_);
 
   const dashboard = {
     meta: {
@@ -187,11 +202,11 @@ function buildDashboard_(leads, sellers, filters, view) {
       states: CONFIG.STATES,
       filters: getFilterOptions_(sellers),
       selectedFilters: filters,
-      unmappedStages: Object.keys(unmappedStages).map(function (stage) {
-        return { stage: stage, count: unmappedStages[stage] };
+      unmappedStages: Array.from(unmappedStages.entries()).map(function (entry) {
+        return { stage: entry[0], count: entry[1] };
       }).sort(function (a, b) { return b.count - a.count; }),
-      unmappedSellers: Object.keys(unmappedSellers).map(function (email) {
-        return { email: email, count: unmappedSellers[email] };
+      unmappedSellers: Array.from(unmappedSellers.entries()).map(function (entry) {
+        return { email: entry[0], count: entry[1] };
       }).sort(function (a, b) { return b.count - a.count; })
     }
   };
@@ -203,30 +218,32 @@ function buildDashboard_(leads, sellers, filters, view) {
     dashboard.stageWise = sellerList;
   }
   if (flags.manager) {
-    dashboard.managerOverview = Object.keys(managerMap).map(function (key) {
-      return finalizeManagerRow_(managerMap[key]);
-    }).sort(function (a, b) { return b.open - a.open; });
+    dashboard.managerOverview = Array.from(managerMap.values()).map(finalizeManagerRow_).sort(function (a, b) { return b.open - a.open; });
   }
   if (flags.activity || flags.overview) {
-    dashboard.activity = Object.keys(activityRows).map(function (email) {
-      return finalizeActivityRow_(activityRows[email]);
-    }).sort(function (a, b) { return b.followUps - a.followUps; });
+    dashboard.activity = Array.from(activityRows.values()).map(finalizeActivityRow_).sort(function (a, b) { return b.followUps - a.followUps; });
   }
   if (flags.aging) {
-    dashboard.aging = Object.keys(agingRows).map(function (email) {
-      return finalizeAgingRow_(agingRows[email]);
-    }).sort(function (a, b) { return b.totalOpen - a.totalOpen; });
+    dashboard.aging = Array.from(agingRows.values()).map(finalizeAgingRow_).sort(function (a, b) { return b.totalOpen - a.totalOpen; });
   }
   if (flags.quality) {
-    dashboard.quality = Object.keys(qualityRows).map(function (email) {
-      return finalizeQualityRow_(qualityRows[email]);
-    }).sort(function (a, b) { return b.priority - a.priority; });
+    dashboard.quality = Array.from(qualityRows.values()).map(finalizeQualityRow_).sort(function (a, b) { return b.priority - a.priority; });
   }
 
   return dashboard;
 }
 
 function getSellers_() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('sellers_data');
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch (e) {
+      // Cache corruption, fallback to fetch
+    }
+  }
+
   const values = getSheetValuesByGid_(CONFIG.SELLERS_GID);
   if (values.length < 2) return {};
 
@@ -244,6 +261,9 @@ function getSellers_() {
       status: stringValue_(readByHeader_(row, header, ['currentstatus', 'status'])) || 'Unknown'
     };
   });
+  
+  // Cache for 1 hour (3600 seconds)
+  cache.put('sellers_data', JSON.stringify(sellers), 3600);
   return sellers;
 }
 
@@ -253,12 +273,16 @@ function getLeads_(sellers, profile) {
   if (values.length < 2) return [];
 
   const header = makeHeaderIndex_(values[0]);
+  const sellersMap = new Map(Object.entries(sellers));
+  
   return values.slice(1).map(function (row) {
     const email = cleanEmail_(readByHeader_(row, header, ['salesemailid']));
-    const sellerMapped = Boolean(sellers[email]);
-    const seller = sellers[email] || makeFallbackSeller_(email);
+    const sellerMapped = sellersMap.has(email);
+    const seller = sellersMap.get(email) || makeFallbackSeller_(email);
     const stageRaw = stringValue_(readByHeader_(row, header, ['currentleadstage']));
     const stateRaw = stringValue_(readByHeader_(row, header, ['currentleadstate']));
+    
+    // Base lead object with only essential fields
     const lead = {
       enquiryCode: stringValue_(readByHeader_(row, header, ['enquirycode'])),
       currentLeadStage: stageRaw,
@@ -299,6 +323,7 @@ function getLeads_(sellers, profile) {
       priorityLead: false
     };
 
+    // Only populate fields needed for current profile
     if (profile.dateFilter || profile.details || profile.aging) {
       lead.leadCreationTime = parseSheetDate_(readByHeader_(row, header, ['leadcreationtime']));
     }
@@ -393,35 +418,35 @@ function finalizeSellerStageRow_(row) {
 function addLeadToManagerRows_(managerMap, lead) {
   const seller = lead.seller || {};
   const key = seller.l1Manager || 'Unassigned';
-  if (!managerMap[key]) {
-    managerMap[key] = {
+  if (!managerMap.has(key)) {
+    managerMap.set(key, {
       manager: key,
-      l2Managers: {},
+      l2Managers: new Set(),
       total: 0,
       open: 0,
       lost: 0,
       won: 0,
       priority: 0,
-      sellers: {},
+      sellers: new Set(),
       totalCalls: 0,
       answeredMinutes: 0
-    };
+    });
   }
-  const row = managerMap[key];
+  const row = managerMap.get(key);
   row.total += 1;
   if (lead.stateKey) row[lead.stateKey] += 1;
   if (lead.priorityLead) row.priority += 1;
   row.totalCalls += lead.totalCalls;
   row.answeredMinutes += lead.answeredMinutes;
-  if (seller.email) row.sellers[seller.email] = true;
-  if (seller.l2Manager) row.l2Managers[seller.l2Manager] = true;
+  if (seller.email) row.sellers.add(seller.email);
+  if (seller.l2Manager) row.l2Managers.add(seller.l2Manager);
 }
 
 function finalizeManagerRow_(row) {
   return {
     manager: row.manager,
-    l2Managers: Object.keys(row.l2Managers).join(', '),
-    sellers: Object.keys(row.sellers).length,
+    l2Managers: Array.from(row.l2Managers).join(', '),
+    sellers: row.sellers.size,
     total: row.total,
     open: row.open,
     lost: row.lost,
@@ -677,6 +702,18 @@ function getSheetValuesByGid_(gid) {
 }
 
 function getLeadSheetValues_(profile) {
+  // Check cache for leads data
+  const cache = CacheService.getScriptCache();
+  const cacheKey = 'leads_data_' + JSON.stringify(profile);
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch (e) {
+      // Cache corruption, fallback to fetch
+    }
+  }
+
   const sheet = getSheetByGid_(CONFIG.LEADS_GID);
   const lastRow = sheet.getLastRow();
   const lastColumn = sheet.getLastColumn();
@@ -718,7 +755,12 @@ function getLeadSheetValues_(profile) {
     });
   });
 
-  return [header].concat(rows);
+  const result = [header].concat(rows);
+  
+  // Cache for 30 minutes (1800 seconds) - shorter cache for leads as they change more frequently
+  cache.put(cacheKey, JSON.stringify(result), 1800);
+  
+  return result;
 }
 
 function getRequiredLeadHeaders_(profile) {
@@ -809,6 +851,12 @@ function getSheetByGid_(gid) {
   })[0];
   if (!sheet) throw new Error('Sheet gid not found: ' + gid);
   return sheet;
+}
+
+function clearCache_() {
+  const cache = CacheService.getScriptCache();
+  cache.remove('sellers_data');
+  cache.remove('leads_data');
 }
 
 function makeHeaderIndex_(headers) {

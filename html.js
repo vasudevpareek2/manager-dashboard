@@ -645,6 +645,37 @@
       display: block;
     }
 
+    .pagination {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+      border-top: 1px solid var(--line);
+    }
+
+    .pagination button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .pagination span {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    body.app-loading {
+      pointer-events: none;
+    }
+
+    body.app-loading::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background: rgba(255, 255, 255, 0.7);
+      z-index: 999;
+    }
+
     @media (max-width: 1180px) {
       .filters {
         grid-template-columns: repeat(3, minmax(140px, 1fr));
@@ -861,6 +892,11 @@
         <div class="table-wrap">
           <table class="detail-table" id="leadDetailsTable"></table>
         </div>
+        <div class="pagination" id="paginationControls" style="display: none;">
+          <button class="ghost-btn" id="prevPageBtn" type="button">Previous</button>
+          <span id="pageInfo">Page 1 of 1</span>
+          <button class="ghost-btn" id="nextPageBtn" type="button">Next</button>
+        </div>
       </div>
     </div>
   </div>
@@ -873,7 +909,13 @@
       filtersReady: false,
       activeView: 'stage',
       filters: {},
-      viewCache: {}
+      viewCache: {},
+      pagination: {
+        currentPage: 1,
+        pageSize: 100,
+        totalPages: 1,
+        total: 0
+      }
     };
 
     const filterIds = ['l1Manager', 'l2Manager', 'region', 'sellerStatus', 'sellerEmail', 'state', 'startDate', 'endDate'];
@@ -906,6 +948,21 @@
           loadDashboard();
         });
       });
+      
+      // Pagination event handlers
+      document.getElementById('prevPageBtn').addEventListener('click', function () {
+        if (appState.pagination.currentPage > 1) {
+          appState.pagination.currentPage--;
+          loadLeadDetailsPage();
+        }
+      });
+      
+      document.getElementById('nextPageBtn').addEventListener('click', function () {
+        if (appState.pagination.currentPage < appState.pagination.totalPages) {
+          appState.pagination.currentPage++;
+          loadLeadDetailsPage();
+        }
+      });
     }
 
     function loadDashboard(forceRefresh) {
@@ -916,6 +973,8 @@
       setLoading(true, 'Loading sheet data...');
       appState.filters = readFilters();
       const cacheKey = makeCacheKey();
+      
+      // Only check cache for the current view (lazy loading)
       if (!forceRefresh && appState.viewCache[cacheKey]) {
         appState.data = appState.viewCache[cacheKey];
         renderDashboard();
@@ -1109,11 +1168,32 @@
       document.getElementById('modalMeta').textContent = 'Loading lead details...';
       document.getElementById('leadDetailsTable').innerHTML = '';
       document.getElementById('leadModal').classList.add('active');
+      
+      // Store current parameters for pagination
+      appState.currentSellerEmail = params.sellerEmail;
+      appState.currentStage = params.stage;
+      appState.currentState = params.state;
+      
+      // Reset pagination
+      appState.pagination = {
+        currentPage: 1,
+        pageSize: 100,
+        totalPages: 1,
+        total: 0
+      };
+      document.getElementById('paginationControls').style.display = 'none';
 
       google.script.run
         .withSuccessHandler(function (result) {
           document.getElementById('modalMeta').textContent = formatNumber(result.total) + ' leads | Updated ' + result.generatedAt;
+          appState.pagination = {
+            currentPage: result.pageNumber,
+            pageSize: result.pageSize,
+            totalPages: result.totalPages,
+            total: result.total
+          };
           renderLeadDetails(result.rows || []);
+          updatePaginationControls();
         })
         .withFailureHandler(function (error) {
           document.getElementById('modalMeta').textContent = 'Could not load details';
@@ -1123,7 +1203,9 @@
           sellerEmail: params.sellerEmail,
           stage: params.stage,
           state: params.state,
-          filters: appState.filters
+          filters: appState.filters,
+          pageNumber: appState.pagination.currentPage,
+          pageSize: appState.pagination.pageSize
         });
     }
 
@@ -1360,6 +1442,13 @@
     function setLoading(isLoading, text) {
       const line = document.getElementById('statusLine');
       line.innerHTML = (isLoading ? '<span class="loading-dot"></span>' : '') + escapeHtml(text || '');
+      
+      // Add progressive loading indicator for better UX
+      if (isLoading) {
+        document.body.classList.add('app-loading');
+      } else {
+        document.body.classList.remove('app-loading');
+      }
     }
 
     function closeModal() {
@@ -1446,6 +1535,50 @@
 
     function escapeAttribute(value) {
       return escapeHtml(value);
+    }
+    
+    function loadLeadDetailsPage() {
+      document.getElementById('modalMeta').textContent = 'Loading page ' + appState.pagination.currentPage + '...';
+      
+      google.script.run
+        .withSuccessHandler(function (result) {
+          document.getElementById('modalMeta').textContent = formatNumber(result.total) + ' leads | Updated ' + result.generatedAt;
+          appState.pagination = {
+            currentPage: result.pageNumber,
+            pageSize: result.pageSize,
+            totalPages: result.totalPages,
+            total: result.total
+          };
+          renderLeadDetails(result.rows || []);
+          updatePaginationControls();
+        })
+        .withFailureHandler(function (error) {
+          document.getElementById('modalMeta').textContent = 'Could not load page';
+          showToast(error && error.message ? error.message : String(error));
+        })
+        .getLeadDetails({
+          sellerEmail: appState.currentSellerEmail,
+          stage: appState.currentStage,
+          state: appState.currentState,
+          filters: appState.filters,
+          pageNumber: appState.pagination.currentPage,
+          pageSize: appState.pagination.pageSize
+        });
+    }
+    
+    function updatePaginationControls() {
+      const pagination = appState.pagination;
+      const controls = document.getElementById('paginationControls');
+      
+      if (pagination.totalPages <= 1) {
+        controls.style.display = 'none';
+        return;
+      }
+      
+      controls.style.display = 'flex';
+      document.getElementById('pageInfo').textContent = 'Page ' + pagination.currentPage + ' of ' + pagination.totalPages;
+      document.getElementById('prevPageBtn').disabled = pagination.currentPage === 1;
+      document.getElementById('nextPageBtn').disabled = pagination.currentPage === pagination.totalPages;
     }
   </script>
 </body>
